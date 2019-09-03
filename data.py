@@ -10,10 +10,20 @@ import datasets
 # --------------------
 # Helper functions
 # --------------------
+def mnist_unnormalize(x):
+    return x.clone().mul_(.3081).add_(.1307)
+
+def mnist_normalize(x):
+    return x.clone().sub_(.1307).div_(.3081)
+
 
 def logit(x, eps=1e-5):
     x.clamp_(eps, 1 - eps)
     return x.log() - (1 - x).log()
+
+def invlogit(x):
+    """" a.k.a logistic """
+    return x.exp()/(1+x.exp())
 
 def one_hot(x, label_size):
     out = torch.zeros(len(x), label_size).to(x.device)

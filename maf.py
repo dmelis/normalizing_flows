@@ -22,6 +22,9 @@ import copy
 
 from data import fetch_dataloaders
 
+import pdb
+import numpy as np
+
 
 parser = argparse.ArgumentParser()
 # action
@@ -53,12 +56,49 @@ parser.add_argument('--batch_size', type=int, default=100)
 parser.add_argument('--n_epochs', type=int, default=50)
 parser.add_argument('--start_epoch', default=0, help='Starting epoch (for logging; to be overwritten when restoring file.')
 parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate.')
+parser.add_argument('--wd', type=float, default=1e-6, help='Weight decay for optimization.')
 parser.add_argument('--log_interval', type=int, default=1000, help='How often to show loss statistics and save samples.')
 
 
 # --------------------
 # Model layers and helpers
 # --------------------
+def get_block_order(k, n, return_blockord = False):
+    # Retrieve indices of 2D array in an order that traverses the input in k x k blocks
+    # This assumes squared input n x n and squared attribute k x k
+    # n: input dimension
+    # k: attribute dim
+    IDX = np.zeros((n,n), dtype = int)
+    for i in range(n) :
+        for j in range(n):
+            I  = i // k
+            J  = j // k
+            ip = i % k # internal indexing within this block
+            jp = j % k
+            IDX[i,j] =  ((n/k)*I + J)*(k**2) + (ip*k + jp)
+    idx2block = dict(zip(range(n**2), IDX.flatten()))
+    order = torch.tensor(sorted(idx2block, key=idx2block.get))
+    return order
+    # if not return_blockord:
+    #     return order
+    # else:
+    #     return order, range(n//k**2)
+
+def randperm_block_order(order, k):
+    # Randomize order in which blocks are traversed, while keep consistent LtoR UtoD
+    # order within each of these
+    n = len(order)
+    nblocks = n//k**2
+    bsize   = k**2
+    blockord = torch.randperm(nblocks)
+    permorder = torch.empty_like(order)
+    #pdb.set_trace()
+    for i in range(nblocks):
+        j = blockord[i].item()
+        #print('{}-th block is {}th'.format(i,j))
+        permorder[i*bsize:(i+1)*bsize]  = order[j*bsize:(j+1)*bsize]
+    #pdb.set_trace()
+    return permorder, blockord
 
 def create_masks(input_size, hidden_size, n_hidden, input_order='sequential', input_degrees=None):
     # MADE paper sec 4:
@@ -80,6 +120,30 @@ def create_masks(input_size, hidden_size, n_hidden, input_order='sequential', in
             degrees += [torch.randint(min_prev_degree, input_size, (hidden_size,))]
         min_prev_degree = min(degrees[-1].min().item(), input_size - 1)
         degrees += [torch.randint(min_prev_degree, input_size, (input_size,)) - 1] if input_degrees is None else [input_degrees - 1]
+
+    elif input_order == 'blocks':
+        order = get_block_order(7, int(np.sqrt(input_size)))
+        degrees += [order] if input_degrees is None else [input_degrees]
+        for _ in range(n_hidden + 1):
+            # TODO: Check that this makes sense - or should we have a differet block structure for hiddens
+            degrees += [torch.arange(hidden_size) % (input_size - 1)]
+        degrees += [order % input_size - 1] if input_degrees is None else [input_degrees % input_size - 1]
+
+    elif input_order == 'blocks-reverse':
+        order = torch.flip(get_block_order(7, int(np.sqrt(input_size))), [0])
+        degrees += [order] if input_degrees is None else [input_degrees]
+        for _ in range(n_hidden + 1):
+            # TODO: Check that this makes sense - or should we have a differet block structure for hiddens
+            degrees += [torch.arange(hidden_size) % (input_size - 1)]
+        degrees += [order % input_size - 1] if input_degrees is None else [input_degrees % input_size - 1]
+
+    elif input_order == 'blocks-random':
+        order, blockord = randperm_block_order(get_block_order(7, int(np.sqrt(input_size))), 7)
+        degrees += [torch.randperm(input_size)] if input_degrees is None else [input_degrees]
+        for _ in range(n_hidden + 1):
+            # TODO: Check that this makes sense - or should we have a differet block structure for hiddens
+            degrees += [torch.arange(hidden_size) % (input_size - 1)]
+        degrees += [order % input_size - 1] if input_degrees is None else [input_degrees % input_size - 1]
 
     # construct masks
     masks = []
@@ -295,6 +359,25 @@ class MADE(nn.Module):
     def log_prob(self, x, y=None):
         u, log_abs_det_jacobian = self.forward(x, y)
         return torch.sum(self.base_dist.log_prob(u) + log_abs_det_jacobian, dim=1)
+
+    def log_prob_partial(self, x, y=None):
+        """Compute partial log probability of autoregressive model
+        Parameters
+        ----------
+        entries : array-like, shape = [n_subset]
+            Subset of indices that will go into loprob compoutation
+        x : array-like
+            Input
+        y : int
+            Class
+        Returns
+        -------
+        log probability : float
+        """
+        u, log_abs_det_jacobian = self.forward(x, y)
+        log_abs_det_jacobian = log_abs_det_jacobian[:,entries]
+        log_probs_base = self.base_dist.log_prob(u)[:,entries]
+        return torch.sum(log_probs_base + log_abs_det_jacobian, dim=1)
 
 
 class MADEMOG(nn.Module):
@@ -592,6 +675,7 @@ def train_and_evaluate(model, train_loader, test_loader, optimizer, args):
 
         # save training checkpoint
         torch.save({'epoch': i,
+                    'args': args,
                     'model_state': model.state_dict(),
                     'optimizer_state': optimizer.state_dict()},
                     os.path.join(args.output_dir, 'model_checkpoint.pt'))
@@ -602,6 +686,7 @@ def train_and_evaluate(model, train_loader, test_loader, optimizer, args):
         if eval_logprob > best_eval_logprob:
             best_eval_logprob = eval_logprob
             torch.save({'epoch': i,
+                        'args': args,
                         'model_state': model.state_dict(),
                         'optimizer_state': optimizer.state_dict()},
                         os.path.join(args.output_dir, 'best_model_checkpoint.pt'))
@@ -609,7 +694,7 @@ def train_and_evaluate(model, train_loader, test_loader, optimizer, args):
         # plot sample
         if args.dataset == 'TOY':
             plot_sample_and_density(model, train_loader.dataset.base_dist, args, step=i)
-        if args.dataset == 'MNIST':
+        if args.dataset == 'MNIST':# and (i+1) % 10 == 0:
             generate(model, train_loader.dataset.lam, args, step=i)
 
 # --------------------
@@ -713,7 +798,7 @@ if __name__ == '__main__':
         raise ValueError('Unrecognized model.')
 
     model = model.to(args.device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-6)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.wd)
 
     if args.restore_file:
         # load model and optimizer states
@@ -743,5 +828,3 @@ if __name__ == '__main__':
             plot_sample_and_density(model, base_dist, args, ranges_density=[[-15,4],[-3,3]], ranges_sample=[[-1.5,1.5],[-3,3]])
         elif args.dataset == 'MNIST':
             generate(model, train_dataloader.dataset.lam, args)
-
-
